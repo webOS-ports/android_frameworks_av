@@ -382,7 +382,7 @@ void CameraService::loadSound() {
     Mutex::Autolock lock(mSoundLock);
     LOG1("CameraService::loadSound ref=%d", mSoundRef);
     if (mSoundRef++) return;
-
+#if 0
     char value[PROPERTY_VALUE_MAX];
     property_get("persist.camera.shutter.disable", value, "0");
     int disableSound = atoi(value);
@@ -395,19 +395,21 @@ void CameraService::loadSound() {
         mSoundPlayer[SOUND_SHUTTER] = NULL;
         mSoundPlayer[SOUND_RECORDING] = NULL;
     }
+#endif
 }
 
 void CameraService::releaseSound() {
     Mutex::Autolock lock(mSoundLock);
     LOG1("CameraService::releaseSound ref=%d", mSoundRef);
     if (--mSoundRef) return;
-
+#if 0
     for (int i = 0; i < NUM_SOUNDS; i++) {
         if (mSoundPlayer[i] != 0) {
             mSoundPlayer[i]->disconnect();
             mSoundPlayer[i].clear();
         }
     }
+#endif
 }
 
 void CameraService::playSound(sound_kind kind) {
