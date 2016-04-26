@@ -542,8 +542,8 @@ status_t CameraService::connectPro(
           case CAMERA_DEVICE_API_VERSION_2_0:
           case CAMERA_DEVICE_API_VERSION_2_1:
           case CAMERA_DEVICE_API_VERSION_3_0:
-            client = new ProCamera2Client(this, cameraCb, String16(),
-                    cameraId, facing, callingPid, USE_CALLING_UID, getpid());
+            client = new ProCamera2Client(this, cameraCb, clientPackageName,
+                    cameraId, facing, callingPid, clientUid, getpid());
             break;
           case -1:
             ALOGE("Invalid camera id %d", cameraId);
@@ -620,8 +620,8 @@ status_t CameraService::connectDevice(
           case CAMERA_DEVICE_API_VERSION_2_0:
           case CAMERA_DEVICE_API_VERSION_2_1:
           case CAMERA_DEVICE_API_VERSION_3_0:
-            client = new CameraDeviceClient(this, cameraCb, String16(),
-                    cameraId, facing, callingPid, USE_CALLING_UID, getpid());
+            client = new CameraDeviceClient(this, cameraCb, clientPackageName,
+                    cameraId, facing, callingPid, clientUid, getpid());
             break;
           case -1:
             ALOGE("Invalid camera id %d", cameraId);
@@ -835,6 +835,7 @@ status_t CameraService::onTransact(
     switch (code) {
         case BnCameraService::CONNECT:
         case BnCameraService::CONNECT_PRO:
+        case BnCameraService::CONNECT_DEVICE:
             const int pid = getCallingPid();
             const int self_pid = getpid();
             if (pid != self_pid) {
@@ -997,6 +998,14 @@ void CameraService::BasicClient::disconnect() {
     mCameraService->removeClientByRemote(mRemoteBinder);
     // client shouldn't be able to call into us anymore
     mClientPid = 0;
+}
+
+status_t CameraService::BasicClient::dump(int, const Vector<String16>&) {
+    // No dumping of clients directly over Binder,
+    // must go through CameraService::dump
+    android_errorWriteWithInfoLog(SN_EVENT_LOG_ID, "26265403",
+            IPCThreadState::self()->getCallingUid(), NULL, 0);
+    return OK;
 }
 
 status_t CameraService::BasicClient::startCameraOps() {
@@ -1236,7 +1245,7 @@ status_t CameraService::dump(int fd, const Vector<String16>& args) {
             hasClient = true;
             result = String8::format("  Device is open. Client instance dump:\n");
             write(fd, result.string(), result.size());
-            client->dump(fd, args);
+            client->dumpClient(fd, args);
         }
         if (!hasClient) {
             result = String8::format("\nNo active camera clients yet.\n");

@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2009 The Android Open Source Project
- * Copyright (c) 2010 - 2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2010 - 2014, The Linux Foundation. All rights reserved.
  *
  * Not a Contribution
  *
@@ -76,6 +76,14 @@
 #include <ctype.h>
 #endif
 
+#ifdef QTI_FLAC_DECODER
+#include "include/FLACDecoder.h"
+#endif
+
+#ifdef MTK_HARDWARE
+#include <bufferallocator/OMXCodecBufferAllocator.h>
+#endif
+
 namespace android {
 
 #ifdef USE_SAMSUNG_COLORFORMAT
@@ -120,9 +128,14 @@ static sp<MediaSource> Make##name(const sp<MediaSource> &source, const sp<MetaDa
 
 #define FACTORY_REF(name) { #name, Make##name },
 
+#ifdef QTI_FLAC_DECODER
+FACTORY_CREATE(FLACDecoder)
+#endif
+
 #ifdef QCOM_DIRECTTRACK
 FACTORY_CREATE(MP3Decoder)
 #endif
+
 FACTORY_CREATE_ENCODER(AACEncoder)
 
 static sp<MediaSource> InstantiateSoftwareEncoder(
@@ -146,7 +159,7 @@ static sp<MediaSource> InstantiateSoftwareEncoder(
     return NULL;
 }
 
-#ifdef QCOM_DIRECTTRACK
+#if defined(QCOM_DIRECTTRACK) || defined (QTI_FLAC_DECODER)
 static sp<MediaSource> InstantiateSoftwareDecoder(
         const char *name, const sp<MediaSource> &source) {
     struct FactoryInfo {
@@ -154,7 +167,12 @@ static sp<MediaSource> InstantiateSoftwareDecoder(
         sp<MediaSource> (*CreateFunc)(const sp<MediaSource> &);
     };
     static const FactoryInfo kFactoryInfo[] = {
+#ifdef QCOM_DIRECTTRACK
         FACTORY_REF(MP3Decoder)
+#endif
+#ifdef QTI_FLAC_DECODER
+        FACTORY_REF(FLACDecoder)
+#endif
     };
     for (size_t i = 0;
          i < sizeof(kFactoryInfo) / sizeof(kFactoryInfo[0]); ++i) {
@@ -165,6 +183,7 @@ static sp<MediaSource> InstantiateSoftwareDecoder(
     return NULL;
 }
 #endif
+
 #undef FACTORY_CREATE_ENCODER
 #undef FACTORY_REF
 
@@ -397,7 +416,27 @@ uint32_t OMXCodec::getComponentQuirks(
         quirks |= kRequiresFlushCompleteEmulation;
     }
 #endif // DOLBY_UDC
-#ifdef OMAP_ENHANCEMENT
+
+#ifdef MTK_HARDWARE
+    if (list->codecHasQuirk(
+                index, "decoder-lies-about-number-of-channels")) {
+        quirks |= kDecoderLiesAboutNumberOfChannels;
+    }
+    if (list->codecHasQuirk(
+                index, "supports-multiple-frames-per-input-buffer")) {
+        quirks |= kSupportsMultipleFramesPerInputBuffer;
+    }
+    if (list->codecHasQuirk(
+                index, "wants-NAL-fragments")) {
+        quirks |= kWantsNALFragments;
+    }
+    if (list->codecHasQuirk(
+                index, "avoid-memcpy-input-recording-frames")) {
+        quirks |= kAvoidMemcopyInputRecordingFrames;
+    }
+#endif
+
+#if OMAP_ENHANCEMENT
     if (list->codecHasQuirk(
                 index, "avoid-memcopy-input-recording-frames")) {
       quirks |= kAvoidMemcopyInputRecordingFrames;
@@ -460,10 +499,10 @@ sp<MediaSource> OMXCodec::Create(
     const char *mime;
     bool success = meta->findCString(kKeyMIMEType, &mime);
     CHECK(success);
-
     Vector<CodecNameAndQuirks> matchingCodecs;
 
 #ifdef QCOM_HARDWARE
+    ExtendedCodec::kHEVCCodecType hevc_codectype = ExtendedCodec::useHEVCDecoder(mime);
     int channelCount = 0;
     int trackId = 0;
     meta->findInt32(kKeyChannelCount, &channelCount);
@@ -472,6 +511,12 @@ sp<MediaSource> OMXCodec::Create(
             && trackId > 1) {
         findMatchingCodecs(mime, createEncoder,
             "OMX.qcom.audio.decoder.multiaac", flags, &matchingCodecs);
+    } else if (hevc_codectype == ExtendedCodec::kCodecType_SWHEVC) {
+               findMatchingCodecs(mime, createEncoder,
+                   "OMX.qcom.video.decoder.hevcswvdec", flags, &matchingCodecs);
+    } else if (hevc_codectype == ExtendedCodec::kCodecType_HWHEVC) {
+               findMatchingCodecs(mime, createEncoder,
+                   "OMX.qcom.video.decoder.hevc", flags, &matchingCodecs);
     } else {
 #endif
         findMatchingCodecs(
@@ -503,14 +548,20 @@ sp<MediaSource> OMXCodec::Create(
             componentName = tmp.c_str();
         }
 
+        sp<MediaSource> softwareCodec;
         if (createEncoder) {
-            sp<MediaSource> softwareCodec =
-                InstantiateSoftwareEncoder(componentName, source, meta);
-            if (softwareCodec != NULL) {
-                ALOGV("Successfully allocated software codec '%s'", componentName);
+            softwareCodec = InstantiateSoftwareEncoder(componentName, source, meta);
+        }
+#ifdef QTI_FLAC_DECODER
+        else {
+            softwareCodec = InstantiateSoftwareDecoder(componentName, source);
+        }
+#endif
 
-                return softwareCodec;
-            }
+        if (softwareCodec != NULL) {
+            ALOGV("Successfully allocated software codec '%s'", componentName);
+
+            return softwareCodec;
         }
 
 #ifdef QCOM_HARDWARE
@@ -643,6 +694,13 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
     ALOGV("configureCodec protected=%d",
          (mFlags & kEnableGrallocUsageProtected) ? 1 : 0);
 
+#ifdef MTK_HARDWARE
+    if (!strncmp(mComponentName, "OMX.MTK.", 8)) {
+        mMtkBufferAllocator->initCodec(mMIME, meta);
+    }
+#endif
+
+
     if (!(mFlags & kIgnoreCodecSpecificData)) {
         uint32_t type;
         const void *data;
@@ -771,8 +829,14 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
         CHECK(meta->findInt32(kKeyChannelCount, &numChannels));
         CHECK(meta->findInt32(kKeySampleRate, &sampleRate));
 
-        if (!meta->findInt32(kKeyAACProfile, &aacProfile)) {
+        if (!meta->findInt32(kKeyAACAOT, &aacProfile)) {
             aacProfile = OMX_AUDIO_AACObjectNull;
+        }
+
+        // Google's AAC decoder can't handle MAIN profile
+        if (!strncmp(mComponentName, "OMX.google.", 11) &&
+                aacProfile == OMX_AUDIO_AACObjectMain) {
+            return ERROR_UNSUPPORTED;
         }
 
         int32_t isADTS;
@@ -860,12 +924,6 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
                 CODEC_LOGE("setAC3Format() failed (err = %d)", err);
                 return err;
             }
-#ifdef ENABLE_AV_ENHANCEMENTS
-            // FFMPEG will convert floating point to 24-bit PCM
-            if (ExtendedUtils::isHiresAudioEnabled()) {
-                meta->setInt32(kKeySampleBits, 24);
-            }
-#endif
         } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_APE, mMIME))  {
             status_t err = setAPEFormat(meta);
             if (err != OK) {
@@ -878,12 +936,6 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
                 CODEC_LOGE("setDTSFormat() failed (err = %d)", err);
                 return err;
             }
-#ifdef ENABLE_AV_ENHANCEMENTS
-            // FFMPEG will convert DTS floating point to 24-bit PCM
-            if (ExtendedUtils::isHiresAudioEnabled()) {
-                meta->setInt32(kKeySampleBits, 24);
-            }
-#endif
         } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_FFMPEG, mMIME))  {
             status_t err = setFFmpegAudioFormat(meta);
             if (err != OK) {
@@ -891,6 +943,8 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
                 return err;
             }
         }
+        getPCMOutputFormat(meta);
+        meta->dumpToLog();
 #ifdef QCOM_HARDWARE
     } else {
         if (!mIsVideo && mIsEncoder) {
@@ -1129,6 +1183,15 @@ static size_t getFrameSize(
 #ifdef USE_SAMSUNG_COLORFORMAT
         case OMX_SEC_COLOR_FormatNV12TPhysicalAddress:
         case OMX_SEC_COLOR_FormatNV12LPhysicalAddress:
+#endif
+#ifdef MTK_HARDWARE
+        /*
+         * FIXME: We use this FrameSize for temp solution
+         * in order to check functionality,
+         * and we need to get FrameSize accurately in the future
+         */
+        case OMX_MTK_COLOR_FormatYV12:
+        case OMX_COLOR_FormatVendorMTKYUV:
 #endif
             return (width * height * 3) / 2;
 #ifdef USE_SAMSUNG_COLORFORMAT
@@ -1584,6 +1647,7 @@ status_t OMXCodec::setupAVCEncoderParameters(const sp<MetaData>& meta) {
     h264type.eLevel = static_cast<OMX_VIDEO_AVCLEVELTYPE>(profileLevel.mLevel);
 
     // XXX
+#ifndef MTK_HARDWARE
 #ifdef USE_TI_DUCATI_H264_PROFILE
     if ((strncmp(mComponentName, "OMX.TI.DUCATI1", 14) != 0)
             && (h264type.eProfile != OMX_VIDEO_AVCProfileBaseline)) {
@@ -1598,6 +1662,7 @@ status_t OMXCodec::setupAVCEncoderParameters(const sp<MetaData>& meta) {
             h264type.eProfile);
         h264type.eProfile = OMX_VIDEO_AVCProfileBaseline;
     }
+#endif
 
     if (h264type.eProfile == OMX_VIDEO_AVCProfileBaseline) {
         h264type.nSliceHeaderSpacing = 0;
@@ -1908,6 +1973,10 @@ OMXCodec::OMXCodec(
     } else
 #endif
         mSource = source;
+
+#ifdef MTK_HARDWARE
+    mMtkBufferAllocator = new OMXCodecBufferAllocator(this);
+#endif
 }
 
 // static
@@ -2021,8 +2090,17 @@ OMXCodec::~OMXCodec() {
 
     mNode = NULL;
 
+#ifdef MTK_HARDWARE
+    if (!strncmp(mComponentName, "OMX.MTK.", 8)) {
+        mMtkBufferAllocator->releaseBuffers();
+    } else {
+        releaseMediaBuffersOn(kPortIndexOutput);
+        releaseMediaBuffersOn(kPortIndexInput);
+    }
+#else
     releaseMediaBuffersOn(kPortIndexOutput);
     releaseMediaBuffersOn(kPortIndexInput);
+#endif
 
     setState(DEAD);
 
@@ -2096,6 +2174,12 @@ status_t OMXCodec::allocateBuffers() {
 }
 
 status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
+#ifdef MTK_HARDWARE
+    if (!strncmp(mComponentName, "OMX.MTK.", 8)) {
+        return mMtkBufferAllocator->allocateBuffersOnPort(portIndex);
+    }
+#endif
+
     if (mNativeWindow != NULL && portIndex == kPortIndexOutput) {
         return allocateOutputBuffersFromNativeWindow();
     }
@@ -2137,6 +2221,9 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
             def.nBufferCountActual, def.nBufferSize,
             portIndex == kPortIndexInput ? "input" : "output");
 
+    if (def.nBufferSize != 0 && def.nBufferCountActual > SIZE_MAX / def.nBufferSize) {
+        return BAD_VALUE;
+    }
     size_t totalSize = def.nBufferCountActual * def.nBufferSize;
     mDealer[portIndex] = new MemoryDealer(totalSize, "OMXCodec");
 
@@ -2310,11 +2397,43 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
     }
 
 #ifndef USE_SAMSUNG_COLORFORMAT
+#ifdef MTK_HARDWARE
+    uint32_t eHalColorFormat;
+    switch (def.format.video.eColorFormat) {
+        case OMX_COLOR_Format32bitARGB8888:
+            eHalColorFormat = HAL_PIXEL_FORMAT_RGBA_8888;
+            break;
+#ifdef MTK_OMX_USES_PRIVATE_YUV
+        default:
+            eHalColorFormat = HAL_PIXEL_FORMAT_YUV_PRIVATE;
+#else
+        case OMX_COLOR_FormatYUV420Planar:
+            eHalColorFormat = HAL_PIXEL_FORMAT_I420;
+            break;
+        case OMX_COLOR_FormatVendorMTKYUV:
+            eHalColorFormat = HAL_PIXEL_FORMAT_NV12_BLK;
+            break;
+        case OMX_MTK_COLOR_FormatYV12:
+            eHalColorFormat = HAL_PIXEL_FORMAT_YV12;
+            break;
+        default:
+            eHalColorFormat = HAL_PIXEL_FORMAT_I420;
+            break;
+#endif
+    }
+
+    err = native_window_set_buffers_geometry(
+            mNativeWindow.get(),
+            def.format.video.nStride,
+            def.format.video.nSliceHeight,
+            eHalColorFormat);
+#else
     err = native_window_set_buffers_geometry(
             mNativeWindow.get(),
             def.format.video.nFrameWidth,
             def.format.video.nFrameHeight,
             def.format.video.eColorFormat);
+#endif
 #else
     OMX_COLOR_FORMATTYPE eColorFormat;
 
@@ -2382,6 +2501,10 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
 
     ALOGV("native_window_set_usage usage=0x%lx", usage);
 
+#ifdef MTK_HARDWARE
+    usage |= (GRALLOC_USAGE_SW_WRITE_OFTEN | GRALLOC_USAGE_SW_READ_OFTEN);
+#endif
+
     err = native_window_set_usage(
             mNativeWindow.get(), usage | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_EXTERNAL_DISP);
 
@@ -2399,12 +2522,23 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
         return err;
     }
 
+#if defined(QCOM_HARDWARE) || defined(MTK_HARDWARE)
+    // Add extra buffer to display queue to get around dequeue+wait
+    // blocking too long in case BufferQueue is in sync-mode and advertises
+    // only 1 buffer. Also, restrict to 2 extra buffers for > 1080p
+    minUndequeuedBufs +=
+        (def.format.video.nFrameWidth * def.format.video.nFrameHeight > 1088 * 1920)
+        ? 2 : 3;
+    ALOGI("NOTE: Overriding minUndequeuedBufs to %d",minUndequeuedBufs);
+#endif
+
     // XXX: Is this the right logic to use?  It's not clear to me what the OMX
     // buffer counts refer to - how do they account for the renderer holding on
     // to buffers?
     if (def.nBufferCountActual < def.nBufferCountMin + minUndequeuedBufs) {
         OMX_U32 newBufferCount = def.nBufferCountMin + minUndequeuedBufs;
         def.nBufferCountActual = newBufferCount;
+        ALOGI("NOTE: Allocating %lu buffers on output port",def.nBufferCountActual);
         err = mOMX->setParameter(
                 mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
         if (err != OK) {
@@ -2753,7 +2887,7 @@ void OMXCodec::on_message(const omx_message &msg) {
 
             // Buffer could not be released until empty buffer done is called.
             if (info->mMediaBuffer != NULL) {
-#ifdef OMAP_ENHANCEMENT
+#if defined(OMAP_ENHANCEMENT) || defined(MTK_HARDWARE)
                 if (mIsEncoder &&
                     (mQuirks & kAvoidMemcopyInputRecordingFrames)) {
                     // If zero-copy mode is enabled this will send the
@@ -3408,7 +3542,11 @@ status_t OMXCodec::freeBuffersOnPort(
     for (size_t i = buffers->size(); i-- > 0;) {
         BufferInfo *info = &buffers->editItemAt(i);
 
+#ifdef MTK_HARDWARE
+        if (onlyThoseWeOwn && (info->mStatus == OWNED_BY_COMPONENT || info->mStatus == OWNED_BY_CLIENT)) {
+#else
         if (onlyThoseWeOwn && info->mStatus == OWNED_BY_COMPONENT) {
+#endif
             continue;
         }
 
@@ -3795,7 +3933,7 @@ bool OMXCodec::drainInputBuffer(BufferInfo *info) {
 
                 CHECK(info->mMediaBuffer == NULL);
                 info->mMediaBuffer = srcBuffer;
-#ifdef OMAP_ENHANCEMENT
+#if defined(OMAP_ENHANCEMENT) || defined(MTK_HARDWARE)
         } else if (mIsEncoder && (mQuirks & kAvoidMemcopyInputRecordingFrames)) {
                 CHECK(mOMXLivesLocally && offset == 0);
 
@@ -3855,6 +3993,13 @@ bool OMXCodec::drainInputBuffer(BufferInfo *info) {
         }
 
         int64_t lastBufferTimeUs;
+#ifdef MTK_HARDWARE
+        // MTK decoders sporadically don't set the time in some buffers
+        if (!(srcBuffer->meta_data()->findInt64(kKeyTime, &lastBufferTimeUs))) {
+            lastBufferTimeUs = 0;
+            srcBuffer->meta_data()->setInt64(kKeyTime, lastBufferTimeUs);
+        }
+#endif
         CHECK(srcBuffer->meta_data()->findInt64(kKeyTime, &lastBufferTimeUs));
         CHECK(lastBufferTimeUs >= 0);
         if (mIsEncoder && mIsVideo) {
@@ -4360,6 +4505,28 @@ status_t OMXCodec::setFFmpegVideoFormat(const sp<MetaData> &meta)
     return err;
 }
 
+status_t OMXCodec::getPCMOutputFormat(const sp<MetaData> &meta)
+{
+    int32_t bitsPerSample = 16;
+    status_t err = OK;
+
+    OMX_AUDIO_PARAM_PCMMODETYPE params;
+    InitOMXParams(&params);
+    params.nPortIndex = kPortIndexOutput;
+
+    err = mOMX->getParameter(
+            mNode, OMX_IndexParamAudioPcm, &params, sizeof(params));
+
+    if (err == OK) {
+        ALOGI("  nSamplingRate = %ld\n", params.nSamplingRate);
+        ALOGI("  nChannels = %ld\n", params.nChannels);
+        ALOGI("  nBitPerSample = %ld\n", params.nBitPerSample);
+
+        meta->setInt32(kKeySampleBits, params.nBitPerSample);
+    }
+    return err;
+}
+
 //audio
 status_t OMXCodec::setMP3Format(const sp<MetaData> &meta)
 {
@@ -4427,7 +4594,13 @@ status_t OMXCodec::setWMAFormat(const sp<MetaData> &meta)
     CHECK(meta->findInt32(kKeyChannelCount, &numChannels));
     CHECK(meta->findInt32(kKeySampleRate, &sampleRate));
     CHECK(meta->findInt32(kKeyBitRate, &bitRate));
-    CHECK(meta->findInt32(kKeyBlockAlign, &blockAlign));
+    if (!meta->findInt32(kKeyBlockAlign, &blockAlign)) {
+        // we should be last on the codec list, but another sniffer may
+        // have handled it and there is no hardware codec.
+        if (!meta->findInt32(kKeyWMABlockAlign, &blockAlign)) {
+            return ERROR_UNSUPPORTED;
+        }
+    }
 
     CODEC_LOGV("Channels: %d, SampleRate: %d, BitRate: %d, blockAlign: %d",
             numChannels, sampleRate, bitRate, blockAlign);
@@ -5286,10 +5459,12 @@ status_t OMXCodec::read(
     }
     *buffer = info->mMediaBuffer;
 
+#ifndef MTK_HARDWARE
     if (info->mOutputCropChanged) {
         initNativeWindowCrop();
         info->mOutputCropChanged = false;
     }
+#endif
     return OK;
 }
 
@@ -5816,7 +5991,7 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
                 CHECK_EQ(err, (status_t)OK);
 
                 CHECK_EQ((int)params.eNumData, (int)OMX_NumericalDataSigned);
-                CHECK_EQ(params.nBitPerSample, 16u);
+                //CHECK_EQ(params.nBitPerSample, 16u);
                 CHECK_EQ((int)params.ePCMMode, (int)OMX_AUDIO_PCMModeLinear);
 
                 int32_t numChannels, sampleRate;
@@ -5931,6 +6106,10 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
 
             mOutputFormat->setInt32(kKeyWidth, video_def->nFrameWidth);
             mOutputFormat->setInt32(kKeyHeight, video_def->nFrameHeight);
+#ifdef MTK_HARDWARE
+            mOutputFormat->setInt32(kKeyStride, video_def->nStride);
+            mOutputFormat->setInt32(kKeySliceHeight, video_def->nSliceHeight);
+#endif
             mOutputFormat->setInt32(kKeyColorFormat, video_def->eColorFormat);
 
             if (!mIsEncoder) {
@@ -5973,9 +6152,12 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
                 }
 
                 if (mNativeWindow != NULL) {
+#ifndef MTK_HARDWARE
                      if (mInSmoothStreamingMode) {
                          mOutputCropChanged = true;
-                     } else {
+                     } else
+#endif
+                     {
                          initNativeWindowCrop();
                      }
                 }
@@ -6061,7 +6243,7 @@ status_t OMXCodec::resumeLocked(bool drainInputBuf) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#ifdef OMAP_ENHANCEMENT
+#if defined(OMAP_ENHANCEMENT) || defined(MTK_HARDWARE)
 void OMXCodec::restorePatchedDataPointer(BufferInfo *info) {
     CHECK(mIsEncoder && (mQuirks & kAvoidMemcopyInputRecordingFrames));
     CHECK(mOMXLivesLocally);
@@ -6070,6 +6252,7 @@ void OMXCodec::restorePatchedDataPointer(BufferInfo *info) {
     header->pBuffer = (OMX_U8 *)info->mData;
 }
 #endif
+
 status_t QueryCodecs(
         const sp<IOMX> &omx,
         const char *mime, bool queryDecoders, bool hwCodecOnly,

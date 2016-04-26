@@ -23,7 +23,7 @@
 #include <binder/BinderService.h>
 #include <binder/IAppOpsCallback.h>
 #include <camera/ICameraService.h>
-#include <hardware/camera.h>
+#include "hardware/camera.h"
 
 #include <camera/ICamera.h>
 #include <camera/ICameraClient.h>
@@ -58,6 +58,9 @@ class CameraService :
 public:
     class Client;
     class BasicClient;
+
+    // Event log ID
+    static const int SN_EVENT_LOG_ID = 0x534e4554;
 
     // Implementation of BinderService<T>
     static char const* getServiceName() { return "media.camera"; }
@@ -148,7 +151,10 @@ public:
             return mRemoteBinder;
         }
 
-        virtual status_t      dump(int fd, const Vector<String16>& args) = 0;
+        // Disallows dumping over binder interface
+        virtual status_t      dump(int fd, const Vector<String16>& args);
+        // Internal dump method to be called by CameraService
+        virtual status_t      dumpClient(int fd, const Vector<String16>& args) = 0;
 
     protected:
         BasicClient(const sp<CameraService>& cameraService,
